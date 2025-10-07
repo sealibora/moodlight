@@ -45,10 +45,10 @@ static const char *const TAG = "moodle_setup";
 
   MoodleSetup::MoodleSetup(web_server_base::WebServerBase *base) : base_(base) { }
 
-  // void MoodleSetup::dump_config() {
-    // ESP_LOGCONFIG(TAG, "user: %s", this->user.c_str());
-    // ESP_LOGCONFIG(TAG, "token: %s", this->token.c_str());
-  // }
+  void MoodleSetup::dump_config() {
+    ESP_LOGCONFIG(TAG, "user: %s", this->user);
+    ESP_LOGCONFIG(TAG, "token: %s", this->token);
+  }
 
 void MoodleSetup::setup() {
 
@@ -240,29 +240,17 @@ void MoodleSetup::handleRequest(AsyncWebServerRequest *req) {
 void MoodleSetup::init_prefs_() {
   // Kasutame stabiilseid 32-bit hash-e võtmeks
   // (samad stringid peavad jääma muutumatuks, et säilitatud väärtused säiliks)
-  uint32_t k_user  = fnv1_hash("moodle_user");
-  uint32_t k_pass  = fnv1_hash("moodle_pass");
-  uint32_t k_token = fnv1_hash("moodle_token");
-  // uint32_t k_pref = fnv1_hash("moodle_pref");
-
-  this->epo_user = global_preferences->make_preference<uint8_t[30]>(k_user, true);
-  this->epo_pass = global_preferences->make_preference<uint8_t[30]>(k_pass, true);
-  this->epo_token = global_preferences->make_preference<uint8_t[30]>(k_token, true);
-  // this->user  = global_preferences->make_preference<uint8_t[30]>(k_user, true);
-  // this->pass  = global_preferences->make_preference<uint8_t[30]>(k_pass, true);
-  // this->token = global_preferences->make_preference<uint8_t[30]>(k_token, true);
+  uint32_t k_pref = fnv1_hash("moodle_pref");
+  this->pref_ = global_preferences->make_preference<MoodleSettings>(k_pref, true);
 }
 
 void MoodleSetup::load_from_prefs_() {
   std::string tmp;
-  if (this->epo_user.load(&tmp))  this->user  = tmp;
-  if (this->epo_pass.load(&tmp))  this->pass  = tmp;
-  if (this->epo_token.load(&tmp)) this->token = tmp;
 
-  // MoodleSettings save{};
-  // if (this->pref_.load(&save)) {
-    // ESP_LOGD(TAG, "Loaded settings: user %s", save.user);
-  // }
+  MoodleSettings save{};
+  if (this->pref_.load(&save)) {
+    ESP_LOGD(TAG, "Loaded settings: user %s", save.user);
+  }
 
 }
 
@@ -270,6 +258,8 @@ void MoodleSetup::save_to_prefs_(const std::string &user, const std::string &pas
   if (!user.empty())  this->epo_user.save(&user);
   if (!pass.empty())  this->epo_pass.save(&pass);
   if (!token.empty()) this->epo_token.save(&token);
+
+
 }
 
 String MoodleSetup::get_param_(AsyncWebServerRequest *req, const char *name) {

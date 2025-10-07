@@ -30,7 +30,7 @@ class MoodleSetup : public AsyncWebHandler, public Component {
  public:
   MoodleSetup(web_server_base::WebServerBase *base);
   MoodleSetup();
-  // void dump_config();
+  void dump_config();
   void setup();
   void loop();
 
@@ -52,6 +52,10 @@ class MoodleSetup : public AsyncWebHandler, public Component {
     }
     if (request->method() == HTTP_POST) {
       if (request->url() == F("/moodle/start"))
+        return true;
+    }
+    if (request->method() == HTTP_POST) {
+      if (request->url() == F("/moodle/request_tasks"))
         return true;
     }
     return false;
