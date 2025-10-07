@@ -11,11 +11,26 @@ namespace esphome {
 namespace moodle_setup {
 
 
+  struct MoodleSettings {
+    char user[33];
+    char password[50];
+    char token[30];
+  } PACKED;
+
+  enum MoodleState : uint8_t {
+    MOODLE_STATE_OFFLINE = 0,
+    MOODLE_STATE_LOGIN,
+    MOODLE_STATE_TOKEN_RECEIVED,
+    MOODLE_STATE_REQUESTING_TASKS,
+    MOODEL_STATE_IDLE
+  };
+
 
 class MoodleSetup : public AsyncWebHandler, public Component {
  public:
   MoodleSetup(web_server_base::WebServerBase *base);
   MoodleSetup();
+  // void dump_config();
   void setup();
   void loop();
 
@@ -47,6 +62,7 @@ class MoodleSetup : public AsyncWebHandler, public Component {
   ESPPreferenceObject epo_user;
   ESPPreferenceObject epo_pass;
   ESPPreferenceObject epo_token;
+  ESPPreferenceObject pref_;
 
   void set_http(esphome::http_request::HttpRequestComponent *h) { this->http_ = h; }
 
@@ -57,6 +73,8 @@ class MoodleSetup : public AsyncWebHandler, public Component {
 
   bool setup_called = false;
  protected:
+  MoodleState state_{MOODLE_STATE_OFFLINE};
+
   web_server_base::WebServerBase *base_;
 
   bool pump = false;
