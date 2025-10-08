@@ -1,5 +1,7 @@
 #include "moodle_setup.h"
 #include "esphome/core/log.h"
+#include "esphome/core/time.h"
+#include "esphome/components/time/real_time_clock.h"
 #include <ESPAsyncWebServer.h>
 //#include <AsyncTCP.h>
 
@@ -33,6 +35,11 @@ static inline std::string url_encode(const std::string &in, bool space_as_plus =
   return out;
 }
 
+// Abifunktsioon paari jaoks: key=value (mõlemad kodeeritud)
+static inline std::string form_pair(const std::string &k, const std::string &v) {
+  return url_encode(k) + "=" + url_encode(v);
+}
+
 
 namespace esphome {
 namespace moodle_setup {
@@ -46,8 +53,8 @@ static const char *const TAG = "moodle_setup";
   MoodleSetup::MoodleSetup(web_server_base::WebServerBase *base) : base_(base) { }
 
   void MoodleSetup::dump_config() {
-    ESP_LOGCONFIG(TAG, "user: %s", this->user);
-    ESP_LOGCONFIG(TAG, "token: %s", this->token);
+    ESP_LOGCONFIG(TAG, "user: %s", this->user.c_str());
+    ESP_LOGCONFIG(TAG, "token: %s", this->token.c_str());
   }
 
 void MoodleSetup::setup() {
@@ -68,7 +75,7 @@ std::string json;
 
 
 void MoodleSetup::loop() {
-  if (this->pump != false) {
+  if (this->state_ == MOODLE_STATE_LOGIN) {
     uint8_t buf[256];
     int n = this->conn_->read(buf, 256);
     ESP_LOGI(TAG, "pump n %d", n);
@@ -90,23 +97,25 @@ void MoodleSetup::loop() {
         ESP_LOGW(TAG, "Token error: %s", root["error"] | "unknown");
         return true;
       });
-
-      this->pump = false;
+      // save token
+      this->save_to_prefs_();
+      this->state_ = MOODLE_STATE_TOKEN_RECEIVED;
       this->conn_->end();
+
     }
     // buf[9] = '\0';
 
     // ESP_LOGI(TAG, "resp code %d", buf);
     // return;
   }
-  if (this->setup_called == true) {
-    this->setup_called = false;
-    ESP_LOGI(TAG, "Loop caught setup_called");
+  if (this->state_ == MOODLE_STATE_START_LOGIN) {
+    ESP_LOGI(TAG, "Loop starts login");
 
     std::string body = "username=" + url_encode(this->user)
-      + "&password=" + url_encode(this->pass)
+      + "&password=" + url_encode(this->password)
       + "&service="  + url_encode("moodle_mobile_app"); // või sinu teenus
 
+    ESP_LOGI(TAG, "user: %s", this->user.c_str());
     if (!this->http_) {
       ESP_LOGI(TAG, "http_ empty");
       return;
@@ -121,9 +130,85 @@ void MoodleSetup::loop() {
     //auto c = this->http_->get("http://192.168.0.174:8000");
     this->conn_ = c;
     ESP_LOGI(TAG, "HTTP status: %d, CL=%d, read=%u", c->status_code, c->content_length, (unsigned)c->get_bytes_read());
-    this->pump = true;
+    this->state_ = MOODLE_STATE_LOGIN;
     return;
   }
+
+  if (this->state_ == MOODLE_STATE_START_REQUESTING_TASKS) {
+    ESP_LOGI(TAG, "Loop starts requesting tasks.");
+
+    uint32_t now;
+    if (!this->time_) {
+      ESP_LOGI(TAG, "time_ NULL");
+    }
+
+    auto t = this->time_ ? this->time_->now() : esphome::ESPTime{};
+    if (t.is_valid()) {
+      uint32_t now = static_cast<uint32_t>(t.timestamp);  // epoch seconds
+      // use 'now' in your Moodle request
+      ESP_LOGI(TAG, "t.timestamp : %d, now %d", t.timestamp, now);
+    } else {
+      // not synced yet → choose a fallback
+      uint32_t now = 1759320000;  // or keep a wide window
+      ESP_LOGI(TAG, "Time FAILED");
+    }
+
+    const uint32_t horizon = t.timestamp + 120 * 24 * 3600;
+
+   std::string body =
+    form_pair("wstoken", this->token) + "&" +
+    form_pair("wsfunction", "core_calendar_get_action_events_by_timesort") + "&" +
+    form_pair("moodlewsrestformat", "json") + "&" +
+    form_pair("timesortfrom", std::to_string(t.timestamp)) + "&" +
+    form_pair("timesortto", std::to_string(horizon)) + "&" +
+    form_pair("limitnum", "20");
+
+   ESP_LOGI(TAG, "BODY: %s", body.c_str());
+   std::list<esphome::http_request::Header> hdr{
+     {"Content-Type", "application/x-www-form-urlencoded"}
+   };
+  
+   auto c = http_->post("https://moodle.tlu.ee/webservice/rest/server.php", body, hdr);
+
+   this->conn_ = c;
+   ESP_LOGI(TAG, "REST HTTP status: %d, CL=%d, read=%u", c->status_code, c->content_length, (unsigned)c->get_bytes_read());
+   this->state_ = MOODLE_STATE_REQUESTING_TASKS;
+   return;
+  }
+  if (this->state_ == MOODLE_STATE_REQUESTING_TASKS) {
+    uint8_t buf[256];
+    int n = this->conn_->read(buf, 256);
+    ESP_LOGI(TAG, "tasks incoming n %d", n);
+    json.append(reinterpret_cast<const char *>(buf), static_cast<size_t>(n));
+
+    buf[n] = '\0';
+    ESP_LOGI(TAG, "buf: %s", buf);
+    if (this->conn_->content_length > 0 && this->conn_->get_bytes_read() >= this->conn_->content_length) {
+      ESP_LOGI(TAG, "pump OFF");
+      esphome::json::parse_json(json, [&](JsonObject root){
+        if (root.containsKey("events")) {
+          this->token = std::string(root["events"].as<const char*>());
+          ESP_LOGI(TAG, "Token OK (len=%u), %s", (unsigned)this->token.size(), this->token.c_str());
+          // salvesta eelistustesse, puhasta parool, jne.
+          //json.clear();
+
+          return true;
+        }
+        ESP_LOGW(TAG, "Token error: %s", root["error"] | "unknown");
+        return true;
+      });
+      // save tasks
+      //this->save_to_prefs_();
+      this->state_ = MOODLE_STATE_IDLE;
+      this->conn_->end();
+
+    }
+    // buf[9] = '\0';
+
+    // ESP_LOGI(TAG, "resp code %d", buf);
+    // return;
+  }
+
 
 }
 
@@ -152,21 +237,19 @@ void MoodleSetup::handleRequest(AsyncWebServerRequest *req) {
     stream->print(this->user.c_str());
                   stream->print(F("<br><br>"
                     "<label>Moodle parool<br>"
-                    "<input type='password' name='pass' value=''></label>"
+                    "<input type='password' name='password' value=''></label>"
                     "<p><em>Soovitus: kasuta parooli asemel web-service tokenit.</em></p>"
                     "<label>Moodle token<br>"
                                   "<input name='token' value=''></label>"));
 
     stream->print(this->token.c_str());
     stream->print(F("<br><br><button type='submit'>Salvesta</button>"
-                    "</form>/moodle</code>"));
-    //stream->print(get_mac_address_pretty().c_str());
-    //stream->print(F("\",\"name\":\""));
-    //stream->print(App.get_name().c_str());
-    //stream->print(F("\",\"aps\":[{}"));
+                    "</form></br>"));
     stream->print(F("<form method='POST' action='/moodle/start'>"                     
-                    "<button type='submit'>Start</button>"
-                    "</form>/moodle</code></p></body></html>"));
+                    "<button type='submit'>Login</button>"
+                    "</form><form method='POST' action='/moodle/request_tasks'>"                     
+                    "<button type='submit'>Request tasks</button>"
+                    "</form></code></p></body></html>"));
 
 
     req->send(stream);
@@ -189,29 +272,28 @@ void MoodleSetup::handleRequest(AsyncWebServerRequest *req) {
       ESP_LOGI(TAG, "Request params: %d", n);
       for (int i = 0; i < n; i++) {
         auto *p = req->getParam(i);
-        if (p->name() == "pass")
-          {
+        if (p->name() == "password") {
             ESP_LOGI(TAG, "[%d] name='%s'  isPost=%d isFile=%d", i, p->name().c_str(), p->isPost(), p->isFile());
             continue;
           }
-        ESP_LOGI(TAG, "[%d] name='%s' value='%s' isPost=%d isFile=%d",
-                 i, p->name().c_str(), p->value().c_str(), p->isPost(), p->isFile());
+        else {
+          ESP_LOGI(TAG, "[%d] name='%s' value='%s' isPost=%d isFile=%d",
+                   i, p->name().c_str(), p->value().c_str(), p->isPost(), p->isFile());
+        }
       }
     const String user_s = get_param_(req, "user");
     ESP_LOGI(TAG, "user %s", req->arg("user"));   
 
-    const String pass_s = get_param_(req, "pass");
+    const String password_s = get_param_(req, "password");
     const String token_s = get_param_(req, "token");
 
     // Uuenda RAM-is olevaid väärtusi (parooli ei kirjuta üle tühjaga)
     if (user_s.length() > 0) this->user = std::string(user_s.c_str());
-    if (pass_s.length() > 0) this->pass = std::string(pass_s.c_str());
+    if (password_s.length() > 0) this->password = std::string(password_s.c_str());
     if (token_s.length() > 0) this->token = std::string(token_s.c_str());
 
     // Kirjuta püsisalvestusse
-    this->save_to_prefs_(std::string(user_s.c_str()),
-                         std::string(pass_s.c_str()),
-                         std::string(token_s.c_str()));
+    this->save_to_prefs_();
 
     String resp;
     resp += F("<!doctype html><html><meta charset='utf-8'>"
@@ -221,18 +303,23 @@ void MoodleSetup::handleRequest(AsyncWebServerRequest *req) {
     req->send(200, "text/html; charset=utf-8", resp);
     ESP_LOGI(TAG, "user %s", user_s.c_str());   
     ESP_LOGI(TAG, "Starting connection to Moodle.");
-    //this->setup_called = true;
+
     }
 
    if (req->url() == F("/moodle/start")) {
      ESP_LOGI(TAG, "POST /moodle/start.");
-      this->setup_called = true;
-      return;
-    }
+     this->state_ = MOODLE_STATE_START_LOGIN;
+     return;
+   }
 
+   if (req->url() == F("/moodle/request_tasks")) {
+     ESP_LOGI(TAG, "POST /moodle/start.");
+     this->state_ = MOODLE_STATE_START_REQUESTING_TASKS;
+     return;
+   }
 
    ESP_LOGI(TAG, "Endpoints ready: GET /moodle, POST /moodle/save, POST /moodle/start");
-   ESP_LOGI(TAG, "setup_called: %d", this->setup_called);
+
    // auto c = http_->get("http://192.168.0.174:8000");
    // ESP_LOGI(TAG, "c: %d", c);
 }
@@ -250,15 +337,25 @@ void MoodleSetup::load_from_prefs_() {
   MoodleSettings save{};
   if (this->pref_.load(&save)) {
     ESP_LOGD(TAG, "Loaded settings: user %s", save.user);
+    this->user = save.user;
+    this->password = save.password;
+    this->token = save.token;
   }
-
+  else {
+    ESP_LOGD(TAG, "Failed to load settings.");
+  }
 }
 
-void MoodleSetup::save_to_prefs_(const std::string &user, const std::string &pass, const std::string &token) {
-  if (!user.empty())  this->epo_user.save(&user);
-  if (!pass.empty())  this->epo_pass.save(&pass);
-  if (!token.empty()) this->epo_token.save(&token);
-
+void MoodleSetup::save_to_prefs_() {
+  MoodleSettings save{};
+  snprintf(save.user, sizeof(save.user), "%s", this->user.c_str());
+  snprintf(save.password, sizeof(save.password), "%s", this->password.c_str());
+  snprintf(save.token, sizeof(save.token), "%s", this->token.c_str());
+  ESP_LOGD(TAG, "save_to_prefs user: %s", save.user);
+  ESP_LOGD(TAG, "save_to_prefs token: %s", save.token);
+  this->pref_.save(&save);
+  // ensure it's written immediately
+  global_preferences->sync();
 
 }
 
@@ -286,6 +383,8 @@ String MoodleSetup::html_escape_(const char *in) {
   #include "esphome/components/json/json_util.h"
 using esphome::json::parse_json;
 
+
+
 bool MoodleSetup::call_ws_(const std::string &url, const std::string &body, std::string &out) {
   if (!http_) return false;
   std::list<esphome::http_request::Header> hdr{
@@ -306,6 +405,7 @@ bool MoodleSetup::call_ws_(const std::string &url, const std::string &body, std:
   out.swap(resp);
   return true;
 }
+
 
 }  // namespace moodle_setup
 }  // namespace esphome

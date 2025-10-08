@@ -6,6 +6,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 #include "esphome/components/http_request/http_request.h"
+#include "esphome/components/time/real_time_clock.h"
 
 namespace esphome {
 namespace moodle_setup {
@@ -14,15 +15,18 @@ namespace moodle_setup {
   struct MoodleSettings {
     char user[33];
     char password[50];
-    char token[30];
+    char token[50];
   } PACKED;
 
   enum MoodleState : uint8_t {
     MOODLE_STATE_OFFLINE = 0,
+    MOODLE_STATE_START_LOGIN,
     MOODLE_STATE_LOGIN,
+    MOODLE_STATE_LOGIN_FAILED,
     MOODLE_STATE_TOKEN_RECEIVED,
     MOODLE_STATE_REQUESTING_TASKS,
-    MOODEL_STATE_IDLE
+    MOODLE_STATE_START_REQUESTING_TASKS,
+    MOODLE_STATE_IDLE
   };
 
 
@@ -38,7 +42,7 @@ class MoodleSetup : public AsyncWebHandler, public Component {
 
   // Getterid kasutamiseks YAML-lambdades
   std::string get_user() const { return user; }
-  std::string get_password() const { return pass; }   // eelista tokenit
+  std::string get_password() const { return password; }   // eelista tokenit
   std::string get_token() const { return token; }
 
   bool canHandle(AsyncWebServerRequest *request) const override {
@@ -63,19 +67,16 @@ class MoodleSetup : public AsyncWebHandler, public Component {
 
   void handleRequest(AsyncWebServerRequest *req) override;
   bool isRequestHandlerTrivial() const { return false; };
-  ESPPreferenceObject epo_user;
-  ESPPreferenceObject epo_pass;
-  ESPPreferenceObject epo_token;
   ESPPreferenceObject pref_;
 
   void set_http(esphome::http_request::HttpRequestComponent *h) { this->http_ = h; }
+  void set_time(esphome::time::RealTimeClock *t) { time_ = t; }
 
   bool call_ws_(const std::string &url, const std::string &body, std::string &out_json);
 
   void set_base_url(const std::string &base_url);
   esphome::http_request::HttpRequestComponent *http_{nullptr};
 
-  bool setup_called = false;
  protected:
   MoodleState state_{MOODLE_STATE_OFFLINE};
 
@@ -87,7 +88,7 @@ class MoodleSetup : public AsyncWebHandler, public Component {
  private:
 
   std::string user;
-  std::string pass;
+  std::string password;
   std::string token;
 
   static String html_escape_(const char *in);
@@ -95,7 +96,10 @@ class MoodleSetup : public AsyncWebHandler, public Component {
 
   void init_prefs_();
   void load_from_prefs_();
-  void save_to_prefs_(const std::string &user, const std::string &pass, const std::string &token);
+  void save_to_prefs_();
+
+  esphome::time::RealTimeClock *time_{nullptr};
+
 
 
 };

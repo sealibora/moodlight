@@ -17,7 +17,7 @@ substitutions:
   # Define a domain for this device to use. i.e. iot.home.lan (so device will appear as athom-smart-plug-v2.iot.home.lan in DNS/DHCP logs)
   dns_domain: ".local"
   # Set timezone of the smart plug. Useful if the plug is in a location different to the HA server. Can be entered in unix Country/Area format (i.e. "Australia/Sydney")
-  timezone: ""
+  timezone: "Tallinn/Europe"
   # Set the duration between the sntp service polling ntp.org servers for an update
   sntp_update_interval: 6h
   # Network time servers for your region, enter from lowest to highest priority. To use local servers update as per zones or countries at: https://www.ntppool.org/zone/@
@@ -361,3 +361,4 @@ moodle_setup:
   id: moodle
   http_id: http_client
   base_url: tlu.ee
+  time_id: sntp_time
