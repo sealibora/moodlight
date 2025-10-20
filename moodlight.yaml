@@ -88,6 +88,14 @@ esphome:
     board_upload.flash_size: 2MB
     board_upload.maximum_size: 2097152
     board_build.ldscript: eagle.flash.2m.ld
+    build_flags:
+      - -I ../../../include
+      - -Os
+      - -ffunction-sections -fdata-sections
+      - -Wl,--gc-sections
+      - -D PIO_FRAMEWORK_ARDUINO_LWIP2_LOW_MEMORY
+      - -D NDEBUG
+
   on_boot:
       then:
         - script.execute: fast_boot_script
@@ -129,7 +137,7 @@ ota:
 
 logger:
   level: ${log_level}
-  baud_rate: 115200
+  baud_rate: 0
 
 mdns:
   disabled: false
@@ -151,8 +159,8 @@ wifi:
 
 captive_portal:
 
-dashboard_import:
-  package_import_url: github://athom-tech/athom-configs/athom-rgbct-light.yaml
+# dashboard_import:
+  # package_import_url: github://athom-tech/athom-configs/athom-rgbct-light.yaml
 
 binary_sensor:
   - platform: status
