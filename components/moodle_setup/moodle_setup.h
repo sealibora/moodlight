@@ -29,6 +29,12 @@ namespace moodle_setup {
     MOODLE_STATE_IDLE
   };
 
+  struct MoodleEvent {
+    uint32_t id = 0;
+    std::string name;
+    uint32_t timestamp;
+  };
+
 
 class MoodleSetup : public AsyncWebHandler, public Component {
  public:

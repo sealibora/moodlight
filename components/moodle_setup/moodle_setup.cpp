@@ -5,6 +5,7 @@
 #include <ESPAsyncWebServer.h>
 //#include <AsyncTCP.h>
 
+#include <rapidjson/error/en.h>
 #include <string>
 
 // RFC3986 "unreserved": ALPHA / DIGIT / "-" / "_" / "." / "~"
@@ -39,6 +40,312 @@ static inline std::string url_encode(const std::string &in, bool space_as_plus =
 static inline std::string form_pair(const std::string &k, const std::string &v) {
   return url_encode(k) + "=" + url_encode(v);
 }
+
+
+// mem_report.h
+
+#include <stdint.h>
+#include <stddef.h>
+
+struct HeapSnapshot {
+  size_t free_bytes = 0;        // total free heap
+  size_t largest_block = 0;     // largest allocatable block
+  uint8_t fragmentation = 0;    // % (ESP8266 only, else derived)
+};
+
+inline HeapSnapshot take_heap_snapshot() {
+  HeapSnapshot s{};
+#if defined(ARDUINO_ARCH_ESP8266)
+  // <Arduino.h> already included by ESPHome; ESP.* is available
+  s.free_bytes     = ESP.getFreeHeap();
+  s.largest_block  = ESP.getMaxFreeBlockSize();
+  s.fragmentation  = ESP.getHeapFragmentation();  // 0..100
+#elif defined(ARDUINO_ARCH_ESP32)
+  // FreeRTOS/IDF heap APIs
+  #include "esp_heap_caps.h"
+  s.free_bytes     = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  s.largest_block  = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // crude fragmentation estimate: 100 * (1 - largest/free)
+  s.fragmentation  = (s.free_bytes > 0)
+                     ? (uint8_t)(100 - (100.0 * (double)s.largest_block / (double)s.free_bytes))
+                     : 0;
+#else
+  // Fallback if ported elsewhere
+  s.free_bytes = s.largest_block = 0;
+  s.fragmentation = 0;
+#endif
+  return s;
+}
+
+
+
+#undef RAPIDJSON_PARSE_DEFAULT_FLAGS
+#define RAPIDJSON_PARSE_DEFAULT_FLAGS ::rapidjson::kParseNoFlags
+
+#include <rapidjson/reader.h>
+#include <string>
+#include <vector>
+using namespace rapidjson;
+
+
+struct EventMinimal {
+  uint32_t id = 0, timesort = 0;
+  std::string name, component, modulename;
+};
+
+
+class ChunkQueue {
+ public:
+  void push(const char* data, size_t n) {
+    if (n) { chunks_.emplace_back(data, n); total_size_ += n; }
+    ESP_LOGI("moodle_setup", "ADDING chunk now: %d", total_size_);
+  }
+  void mark_eof() { eof_ = true; }
+  bool eof() const { return eof_ && total_size_ == 0; }
+
+  // NEW: drop already-consumed chunk(s) at the front
+  void drop_empty_front_() {
+    while (!chunks_.empty() && chunks_.front().second == 0) {
+      ESP_LOGI("moodle_setup", "POP chunk");
+      chunks_.pop_front();
+    }
+  }
+  
+  char peek() {
+    drop_empty_front_();
+    if (chunks_.empty()) return '\0';
+    return chunks_.front().first[0];
+  }
+
+  char take() {
+    drop_empty_front_();
+    if (chunks_.empty()) return '\0';
+    auto& front = chunks_.front();
+    char c = front.first[0];
+    //ESP_LOGI("moodle_setup", "TAKE %d", c);
+    front.first.remove_prefix(1);
+    front.second -= 1;
+    total_size_ -= 1;
+    // don’t pop here; next call will drop it via drop_empty_front_()
+    return c;
+  }
+
+  bool clear() {
+    chunks_.clear();
+    total_size_ = 0;
+    eof_ = false;
+    return true;
+  }
+
+ private:
+  struct View {
+    std::string storage;
+    std::string_view first;
+    size_t second;
+    View(const char* p, size_t n) : storage(p, n), first(storage.data(), n), second(n) {}
+  };
+  std::deque<View> chunks_;
+  size_t total_size_ = 0;
+  bool eof_ = false;
+};
+
+
+
+#include <rapidjson/reader.h>
+
+ struct ChunkedInputStream {
+   using Ch = char;
+   explicit ChunkedInputStream(ChunkQueue& q) : q_(q), tell_(0) {}
+   Ch Peek() {                // called a lot; must be fast
+     last_ = q_.peek();
+     return last_;
+   }
+   Ch Take() {                // advances one byte
+     Ch c = q_.take();
+     if (c != '\0') ++tell_;
+     return c;
+   }
+   size_t Tell() const { return tell_; }
+
+   // Unused by non-insitu parsing:
+   Ch*   PutBegin() { return nullptr; }
+   void  Put(Ch) {}
+   size_t PutEnd(Ch*) { return 0; }
+
+   void Reset() { tell_ = 0; }
+ private:
+   ChunkQueue& q_;
+   size_t tell_;
+   Ch last_{0};
+ };
+
+
+
+ #include <rapidjson/reader.h>
+using namespace rapidjson;
+
+struct MinimalEvent {
+  uint64_t id = 0;
+  bool overdue = false;
+  bool hasId = false;
+  std::string name; 
+  bool hasOverdue = false;
+  void reset(){ id=0; overdue=false; hasId=false; hasOverdue=false; }
+};
+
+struct EventsHandler : BaseReaderHandler<UTF8<>, EventsHandler> {
+  bool inEvents = false, inEventObj = false;
+  std::string curKey;
+  MinimalEvent ev;
+
+  // top-level key detection
+  bool Key(const char* s, SizeType n, bool) {
+    // if (!inEventObj) curKey.assign(s, n);
+    curKey.assign(s, n);
+    ESP_LOGI("moodle", "event KEY %s", curKey.c_str());
+    return true;
+  }
+  bool StartArray() {
+    ESP_LOGI("moodle", "STARTARRAY!!!!!!");
+    if (curKey == "events" && !inEvents) {
+      ESP_LOGI("moodle", "TURNING inEvents ON");
+      inEvents = true;
+    }
+    return true;
+  }
+  bool EndArray(SizeType){ ESP_LOGI("moodle", "ENDARRAY!!!!!!"); if (inEvents) inEvents = false; return true; }
+
+  bool StartObject() {     ESP_LOGI("moodle", "STARTOBJECT!!!!!!"); if (inEvents) { inEventObj = true; ev.reset(); } return true; }
+  bool EndObject(SizeType) {
+    ESP_LOGI("moodle", "ENDOBJECT!!!!!!");
+    if (inEventObj) {
+      ESP_LOGI("moodle", "inEventObj %d", ev.id);
+      if (ev.hasId) {
+        handle_event(ev.id, ev.overdue);
+      }
+      inEventObj = false;
+    }
+    return true;
+  }
+
+  // values inside event objects
+  bool KeyInEvent(const char* s, SizeType n){     ESP_LOGI("moodle", "KEYINEVENT!!!!!!"); curKey.assign(s, n); return true; }
+  bool Uint(unsigned v){ ESP_LOGI("moodle", "UINT!!!!! curKey: %s, %d", curKey.c_str(), v); if (inEventObj && curKey=="id") {  ev.id=v; ev.hasId=true; } return true; }
+  bool Uint64(uint64_t v){    ESP_LOGI("moodle", "UINT64!!!!!!"); if (inEventObj && curKey=="id"){ ev.id=v; ev.hasId=true; } return true; }
+  bool Int(int v){    ESP_LOGI("moodle", "INT!!!!!!"); if (inEventObj && curKey=="id"){ ev.id=(uint64_t)v; ev.hasId=true; } return true; }
+  bool Bool(bool b){    ESP_LOGI("moodle", "BOOL!!!!!!"); if (inEventObj && curKey=="overdue"){ ev.overdue=b; ev.hasOverdue=true; } return true; }
+
+  // ignore everything else
+  bool Null(){ ESP_LOGI("moodle", "NULL!!!!!!"); return true; }
+  bool Double(double){ ESP_LOGI("moodle", "DOUBLE!!!!!!"); return true; }
+  bool Int64(int64_t v){ ESP_LOGI("moodle", "Int64!!!!!!"); return Int((int)v); }
+  bool String(const char* c, SizeType s, bool b)
+  {
+    if (curKey == "name" && inEventObj) {
+      ev.name.assign(c, s);
+      ESP_LOGI("moodle_setup", "String name %s", ev.name.c_str());
+    }
+    return true;
+  } 
+  bool RawNumber(const char*, SizeType, bool){ ESP_LOGI("moodle", "RawNumber!!!!!!"); return true; }
+
+  // hook to your code
+  static void handle_event(uint64_t id, bool overdue) {
+    // TODO: your lightweight action here (don’t allocate big strings)
+    ESP_LOGI("moodle", "HANDLE_EVENT!!!!!!");
+    //    ESP_LOGI("moodle", "event id=%llu overdue=%s", (unsigned long long)id, overdue ? "true":"false");
+  }
+};
+
+
+
+ #include <rapidjson/reader.h>
+using namespace rapidjson;
+
+class EventsStreamParser {
+ public:
+  EventsStreamParser() : stream_(queue_) {
+    // Force non-insitu parsing even if project defines defaults elsewhere
+    reader_.IterativeParseInit();
+  }
+
+  // Call this for each incoming chunk. Set eof=true for the last chunk.
+  // Returns true when a full JSON document is completely parsed.
+  bool feed(const char* data, size_t n, bool eof=false) {
+    if (reader_.HasParseError()) {
+      auto code = reader_.GetParseErrorCode();
+      auto off  = reader_.GetErrorOffset();
+
+      ESP_LOGE("moodle", "WE STILL HAVE JSON parse error: %d at offset %u",
+               (int)code, (unsigned)off);
+      // error_ = true;
+      // return false;
+    }
+    
+    ESP_LOGE("moodle", "eof %d", eof);
+
+
+    // ESP_LOGI("moodle", "feed %d", n);
+    if (n) queue_.push(data, n);
+    if (eof) queue_.mark_eof();
+    const bool may_have_more = !eof;
+    // Pump the parser as far as we can with the bytes we have.
+    while (reader_.IterativeParseNextNonFatal<kParseStopWhenDoneFlag>(stream_, handler_, may_have_more)) {
+      // keep going until RapidJSON needs more input or is done
+      //      ESP_LOGI("moodle", "keep going until RapidJJson in done");
+    }
+    ESP_LOGI("moodle", "while loop END");
+    if (reader_.IterativeParseComplete()) {
+      ESP_LOGI("moodle", "END feed parse complete");
+      return true; // finished cleanly
+    }
+
+    if (reader_.HasParseError()) {
+      auto code = reader_.GetParseErrorCode();
+      auto off  = reader_.GetErrorOffset();
+
+      // If not real EOF yet, treat "termination-like" errors as "need more data"
+      if (!queue_.eof()) {
+        // just wait for more bytes; DO NOT mark error_
+        return false;
+      }
+
+      ESP_LOGE("moodle", "JSON parse error: %d at offset %u",
+               (int)code, (unsigned)off);
+      error_ = true;
+      return false;
+    }
+
+    // ESP_LOGI("moodle", "while loop");
+    if (reader_.HasParseError()) {
+      // If we reached EOF and still got an error -> real parse error.
+      ESP_LOGE("moodle", "JSON parse error");
+      if (queue_.eof()) {
+        auto code = reader_.GetParseErrorCode();
+        // Optional: log or map code to message
+        ESP_LOGE("moodle", "JSON parse error: %d at offset %u", (int)code, (unsigned)reader_.GetErrorOffset());
+        error_ = true;
+      }
+      // else: parser just needs more data; ignore for now
+    }
+    // ESP_LOGI("moodle", "while return");
+    return false;
+  }
+
+  bool has_error() const { return error_; }
+  bool clear() { stream_.Reset(); queue_.clear(); reader_.IterativeParseInit(); return true; }
+
+ private:
+  ChunkQueue queue_;
+  ChunkedInputStream stream_;
+  Reader reader_;
+  EventsHandler handler_;
+  bool error_ = false;
+};
+
+EventsStreamParser parser;
+
+
 
 
 namespace esphome {
@@ -161,46 +468,64 @@ void MoodleSetup::loop() {
     form_pair("moodlewsrestformat", "json") + "&" +
     form_pair("timesortfrom", std::to_string(t.timestamp)) + "&" +
     form_pair("timesortto", std::to_string(horizon)) + "&" +
-    form_pair("limitnum", "20");
+    form_pair("limitnum", "1");
 
    ESP_LOGI(TAG, "BODY: %s", body.c_str());
    std::list<esphome::http_request::Header> hdr{
      {"Content-Type", "application/x-www-form-urlencoded"}
    };
-  
-   auto c = http_->post("https://moodle.tlu.ee/webservice/rest/server.php", body, hdr);
+
+   parser.clear();
+   auto c = http_->get("http://192.168.0.100:7788/events-one-clean.json");
+
+   // auto c = http_->post("https://moodle.tlu.ee/webservice/rest/server.php", body, hdr);
 
    this->conn_ = c;
-   ESP_LOGI(TAG, "REST HTTP status: %d, CL=%d, read=%u", c->status_code, c->content_length, (unsigned)c->get_bytes_read());
+    ESP_LOGI(TAG, "REST HTTP status: %d, CL=%d, read=%u", c->status_code, c->content_length, (unsigned)c->get_bytes_read());
    this->state_ = MOODLE_STATE_REQUESTING_TASKS;
+
    return;
   }
   if (this->state_ == MOODLE_STATE_REQUESTING_TASKS) {
-    uint8_t buf[256];
-    int n = this->conn_->read(buf, 256);
+    uint8_t buf[100];
+    auto s = take_heap_snapshot();
+    ESP_LOGI(TAG, "[tick] free=%u, largest=%u, frag=%u%%",
+             (unsigned)s.free_bytes, (unsigned)s.largest_block, (unsigned)s.fragmentation);
+    int n = this->conn_->read(buf, 100);
     ESP_LOGI(TAG, "tasks incoming n %d", n);
-    json.append(reinterpret_cast<const char *>(buf), static_cast<size_t>(n));
+    if (n < 0) {
+      ESP_LOGI(TAG, "TASKS END");
+      this->state_ = MOODLE_STATE_IDLE;
+    }
+    //json.append(reinterpret_cast<const char *>(buf), static_cast<size_t>(n));
+    parser.feed((const char *)buf, n);
+    s = take_heap_snapshot();
+    ESP_LOGI(TAG, "[tick2] free=%u, largest=%u, frag=%u%%",
+             (unsigned)s.free_bytes, (unsigned)s.largest_block, (unsigned)s.fragmentation);
 
     buf[n] = '\0';
     ESP_LOGI(TAG, "buf: %s", buf);
+    ESP_LOGI(TAG, "REQUESTING TASKS status: %d, CL=%d, read=%u", this->conn_->status_code, this->conn_->content_length, (unsigned)this->conn_->get_bytes_read());
+    if (n == 0) {
+      this->state_ = MOODLE_STATE_IDLE;
+      ESP_LOGI(TAG, "Closing connection");
+      this->conn_->end();
+      
+      return;
+    }
+
+    // Create once; set 'chunked' true if server uses Transfer-Encoding: chunked
+
+  
+    
+
     if (this->conn_->content_length > 0 && this->conn_->get_bytes_read() >= this->conn_->content_length) {
       ESP_LOGI(TAG, "pump OFF");
-      esphome::json::parse_json(json, [&](JsonObject root){
-        if (root.containsKey("events")) {
-          this->token = std::string(root["events"].as<const char*>());
-          ESP_LOGI(TAG, "Token OK (len=%u), %s", (unsigned)this->token.size(), this->token.c_str());
-          // salvesta eelistustesse, puhasta parool, jne.
-          //json.clear();
-
-          return true;
-        }
-        ESP_LOGW(TAG, "Token error: %s", root["error"] | "unknown");
-        return true;
-      });
       // save tasks
       //this->save_to_prefs_();
       this->state_ = MOODLE_STATE_IDLE;
       this->conn_->end();
+      //parser.feed(NULL, 0, true);
 
     }
     // buf[9] = '\0';
@@ -313,12 +638,12 @@ void MoodleSetup::handleRequest(AsyncWebServerRequest *req) {
    }
 
    if (req->url() == F("/moodle/request_tasks")) {
-     ESP_LOGI(TAG, "POST /moodle/start.");
+     ESP_LOGI(TAG, "POST /moodle/request_tasks.");
      this->state_ = MOODLE_STATE_START_REQUESTING_TASKS;
      return;
    }
 
-   ESP_LOGI(TAG, "Endpoints ready: GET /moodle, POST /moodle/save, POST /moodle/start");
+   ESP_LOGI(TAG, "Endpoints ready: GET /moodle, POST /moodle/save, POST /moodle/start, POST /moodle/request_tasks");
 
    // auto c = http_->get("http://192.168.0.174:8000");
    // ESP_LOGI(TAG, "c: %d", c);
@@ -380,31 +705,6 @@ String MoodleSetup::html_escape_(const char *in) {
   return out;
 }
 
-  #include "esphome/components/json/json_util.h"
-using esphome::json::parse_json;
-
-
-
-bool MoodleSetup::call_ws_(const std::string &url, const std::string &body, std::string &out) {
-  if (!http_) return false;
-  std::list<esphome::http_request::Header> hdr{
-    {"Content-Type", "application/x-www-form-urlencoded"}
-  };
-  ESP_LOGI(TAG, "CALL_WS_ %s", url);
-  return false;
-  auto c = http_->post(url, body, hdr);
-  if (!c) return false;
-
-  std::string resp;
-  uint8_t buf[256];
-  for (;;) { int n = c->read(buf, sizeof(buf)); if (n <= 0) break; resp.append((char*)buf, n); }
-  int code = c->status_code; c->end();
-
-  ESP_LOGI(TAG, "HTTP %d, %u bytes", code, (unsigned)resp.size());
-  if (!esphome::http_request::is_success(code)) return false;  // 2xx
-  out.swap(resp);
-  return true;
-}
 
 
 }  // namespace moodle_setup
